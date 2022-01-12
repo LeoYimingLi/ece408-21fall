@@ -1,0 +1,185 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2580
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;\f1\fnil\fcharset134 PingFangSC-Regular;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 #include <wb.h>\
+\
+#define wbCheck(stmt)                                                     \\\
+  do \{                                                                    \\\
+    cudaError_t err = stmt;                                               \\\
+    if (err != cudaSuccess) \{                                             \\\
+      wbLog(ERROR, "CUDA error: ", cudaGetErrorString(err));              \\\
+      wbLog(ERROR, "Failed to run stmt ", #stmt);                         \\\
+      return -1;                                                          \\\
+    \}                                                                     \\\
+  \} while (0)\
+\
+//@@ Define any useful program-wide constants here\
+#define MASK_WIDTH 3\
+#define MASK_RADIUS 1\
+#define TILE_WIDTH 8\
+#define BLOCK_WIDTH (TILE_WIDTH + MASK_WIDTH-1)\
+// should try to use different TILE_WIDTH and MASK_WIDTH to get ideas of algorithms; \
+\
+//@@ Define constant memory for device kernel here\
+__constant__ float deviceKernel[MASK_WIDTH][MASK_WIDTH][MASK_WIDTH];\
+\
+__global__ void conv3d(float *input, float *output, \
+                       const int z_size, const int y_size, const int x_size) \{\
+  //@@ Insert kernel code here\
+  // output offset\
+  int tx = threadIdx.x;\
+  int ty = threadIdx.y;\
+  int tz = threadIdx.z;\
+  \
+// 
+\f1 \'bb\'b9\'ca\'c7\'d3\'a6\'b8\'c3\'d3\'c3
+\f0 z, y, x
+\f1 _o \'b8\'fc\'ba\'c3\'bf\'b4\'a3\'ac\'d3\'c3hgt, row, col \'bf\'b4\'b5\'c3\'b1\'f0\'c5\'a4\'a1\'a3\'a1\'a3\'a1\'a3
+\f0 \
+  // output coordinates\
+  int hgt_o = blockIdx.z * TILE_WIDTH + tz;\
+  int row_o = blockIdx.y * TILE_WIDTH + ty;\
+  int col_o = blockIdx.x * TILE_WIDTH + tx;\
+  \
+  // input coordinates\
+  int hgt_i = hgt_o - MASK_RADIUS;\
+  int row_i = row_o - MASK_RADIUS;\
+  int col_i = col_o - MASK_RADIUS;\
+  \
+  __shared__ float input_tile[BLOCK_WIDTH][BLOCK_WIDTH][BLOCK_WIDTH];\
+  // load data, each thread reads once; ghostcells are set to 0;\
+  if ((hgt_i>=0) && (hgt_i<z_size) && \
+      (row_i>=0) && (row_i<y_size) && \
+      (col_i>=0) && (col_i<x_size)) \{\
+    input_tile[tz][ty][tx] = input[hgt_i * y_size * x_size \
+                             + row_i * x_size + col_i];\
+  \} else \{\
+    input_tile[tz][ty][tx] = 0.0f;\
+  \}\
+  __syncthreads();\
+  \
+  float value = 0.0f;\
+  if(tz < TILE_WIDTH && ty < TILE_WIDTH && tx < TILE_WIDTH)\{  // some threads do not calculate the value;\
+    for(int i = 0; i < MASK_WIDTH; i++) \{\
+      for(int j = 0; j < MASK_WIDTH; j++) \{\
+        for(int k = 0; k < MASK_WIDTH; k++) \{\
+          value += deviceKernel[i][j][k] * input_tile[i+tz][j+ty][k+tx];\
+        \}\
+      \}\
+    \}\
+    \
+    if(hgt_o < z_size && row_o < y_size && col_o < x_size)\
+      output[hgt_o * (y_size * x_size) + row_o * x_size + col_o] = value;\
+  \} // end of if selecting output\
+// tile threads\
+  \
+\}\
+\
+int main(int argc, char *argv[]) \{\
+  wbArg_t args;\
+  int z_size;\
+  int y_size;\
+  int x_size;\
+  int inputLength, kernelLength;\
+  float *hostInput;\
+  float *hostKernel;\
+  float *hostOutput;\
+  float *deviceInput;\
+  float *deviceOutput;\
+  // no device kernel here?\
+  \
+  args = wbArg_read(argc, argv);\
+\
+  // Import data\
+  hostInput = (float *)wbImport(wbArg_getInputFile(args, 0), &inputLength);\
+  hostKernel =\
+      (float *)wbImport(wbArg_getInputFile(args, 1), &kernelLength);\
+  hostOutput = (float *)malloc(inputLength * sizeof(float));\
+\
+  // First three elements are the input dimensions\
+  z_size = hostInput[0];\
+  y_size = hostInput[1];\
+  x_size = hostInput[2];\
+  wbLog(TRACE, "The input size is ", z_size, "x", y_size, "x", x_size);\
+  assert(z_size * y_size * x_size == inputLength - 3); \
+  assert(kernelLength == 27);\
+\
+  wbTime_start(GPU, "Doing GPU Computation (memory + compute)");\
+\
+  wbTime_start(GPU, "Doing GPU memory allocation");\
+  //@@ Allocate GPU memory here\
+  // Recall that inputLength is 3 elements longer than the input data\
+  // because the first  three elements were the dimensions\
+  // int real_size = z_size * y_size * x_size;\
+  // int real_size = inputLength - 3;\
+  cudaMalloc((void **) &deviceInput, z_size * y_size * x_size * sizeof(float));\
+  cudaMalloc((void **) &deviceOutput, z_size * y_size * x_size * sizeof(float));\
+\
+  wbTime_stop(GPU, "Doing GPU memory allocation");\
+\
+  wbTime_start(Copy, "Copying data to the GPU");\
+  //@@ Copy input and kernel to GPU here\
+  // Recall that the first three elements of hostInput are dimensions and\
+  // do not need to be copied to the gpu\
+  // 'hostInput' is address, so we use hostInput + 3;\
+  cudaMemcpy(deviceInput, hostInput + 3,  \
+             z_size * y_size * x_size * sizeof(float), cudaMemcpyHostToDevice);\
+  cudaMemcpyToSymbol(deviceKernel, hostKernel, \
+                     kernelLength * sizeof(float), 0, cudaMemcpyHostToDevice);\
+  wbTime_stop(Copy, "Copying data to the GPU");\
+\
+  wbTime_start(Compute, "Doing the computation on the GPU");\
+  //@@ Initialize grid and block dimensions here\
+  // before and after, all need to add 2 * radius\
+  /*\
+  dim3 dimGrid(ceil(z_size/(1.0*TILE_WIDTH)), \
+               ceil(y_size/(1.0*TILE_WIDTH)), \
+               ceil(x_size/(1.0*TILE_WIDTH)));\
+  */\
+  dim3 dimGrid(ceil(x_size/(1.0*TILE_WIDTH)), \
+               ceil(y_size/(1.0*TILE_WIDTH)), \
+               ceil(z_size/(1.0*TILE_WIDTH)));\
+  dim3 dimBlock(TILE_WIDTH + MASK_WIDTH-1, \
+                TILE_WIDTH + MASK_WIDTH-1, \
+                TILE_WIDTH + MASK_WIDTH-1);\
+  \
+  //@@ Launch the GPU kernel her\
+  conv3d<<<dimGrid, dimBlock>>>(deviceInput, deviceOutput, \
+                                z_size, y_size, x_size);\
+  \
+  cudaDeviceSynchronize();\
+  wbTime_stop(Compute, "Doing the computation on the GPU");\
+\
+  wbTime_start(Copy, "Copying data from the GPU");\
+  //@@ Copy the device memory back to the host here\
+  // Recall that the first three elements of the output are the dimensions\
+  // and should not be set here (they are set below)\
+  // how to cpy that into next 3 places? \
+  // so cool here;\
+  cudaMemcpy(hostOutput + 3, deviceOutput, \
+             z_size * y_size * x_size * sizeof(float), cudaMemcpyDeviceToHost);\
+  \
+  wbTime_stop(Copy, "Copying data from the GPU");\
+\
+  wbTime_stop(GPU, "Doing GPU Computation (memory + compute)");\
+\
+  // Set the output dimensions for correctness checking\
+  hostOutput[0] = z_size;\
+  hostOutput[1] = y_size;\
+  hostOutput[2] = x_size;\
+  wbSolution(args, hostOutput, inputLength);\
+\
+  // Free device memory\
+  cudaFree(deviceInput);\
+  cudaFree(deviceOutput);\
+\
+  // Free host memory\
+  free(hostInput);\
+  free(hostOutput);\
+  return 0;\
+\}\
+}
